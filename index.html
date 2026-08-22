@@ -251,6 +251,30 @@ select.input{appearance:none;background-image:linear-gradient(45deg,transparent 
 .note.warn{border-right-color:var(--lose)}
 .note.violet{border-right-color:var(--violet)}
 
+/* دردشة المباراة */
+.chat{background:var(--surface);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.chat-head{display:flex;align-items:center;gap:8px;padding:10px 13px;border-bottom:1px solid var(--line);
+  background:var(--bg-2)}
+.chat-head b{font-size:.74rem;font-weight:900;flex:1}
+.chat-log{max-height:290px;overflow-y:auto;padding:12px 13px;display:flex;flex-direction:column;gap:9px}
+.msg{max-width:82%;padding:7px 12px;border-radius:14px;font-size:.74rem;line-height:1.65;
+  align-self:flex-start;background:var(--surface-2);border:1px solid var(--line);
+  border-bottom-right-radius:5px}
+.msg.mine{align-self:flex-end;background:var(--gold-soft);border-color:var(--gold-line);
+  border-bottom-right-radius:14px;border-bottom-left-radius:5px}
+.msg .who{font-size:.58rem;font-weight:800;color:var(--ink-3);margin-bottom:2px}
+.msg time{display:block;font-size:.54rem;color:var(--ink-3);font-family:'Oxanium';margin-top:3px;
+  text-align:left}
+.chat-bar{display:flex;gap:7px;padding:10px 11px;border-top:1px solid var(--line);background:var(--bg-2)}
+.chat-bar input{flex:1;background:var(--surface);border:1px solid var(--line-2);border-radius:30px;
+  padding:9px 14px;font-size:.74rem;font-weight:600;min-width:0}
+.chat-bar input:focus{outline:none;border-color:var(--gold)}
+.chat-send{width:38px;height:38px;border-radius:50%;border:none;background:var(--gold-grad);
+  color:#1a1206;font-size:.9rem;font-weight:900;cursor:pointer;flex-shrink:0;display:grid;place-items:center}
+.chat-send:disabled{opacity:.4;cursor:not-allowed}
+.chat-shut{padding:20px 14px;text-align:center;color:var(--ink-3);font-size:.7rem;line-height:1.9}
+.chat-shut b{display:block;color:var(--ink-2);font-weight:800;font-size:.74rem;margin-bottom:3px}
+
 /* شاشة الانتظار — حالة استعداد اللاعب */
 .wait{text-align:center;padding:30px 14px 10px}
 .wait-mark{width:64px;height:64px;margin:0 auto 16px;border-radius:20px;
@@ -394,6 +418,15 @@ const U = {
     const day = new Intl.DateTimeFormat('en-CA',{timeZone:CFG.TZ}).format(d);
     const tm = new Intl.DateTimeFormat('en-GB',{timeZone:CFG.TZ,hour:'2-digit',minute:'2-digit'}).format(d);
     return `${U.fmtDate(day)} · ${U.fmtTime(tm)}`;
+  },
+  // الرياض بلا توقيت صيفي — الإزاحة +03:00 ثابتة
+  matchMoment(m){ return new Date(`${m.match_date}T${(m.match_time||'21:00').slice(0,5)}:00+03:00`); },
+  mins(ms){ return Math.round(ms/60000); },
+  humanWait(mins){
+    if(mins < 60) return `${mins} دقيقة`;
+    const h = Math.floor(mins/60), d = Math.floor(h/24);
+    if(h < 24) return `${h} ساعة`;
+    return `${d} يوم`;
   },
   esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); },
   initials(name){ return String(name||'؟').trim().charAt(0); }
@@ -681,6 +714,36 @@ const Store = {
     const { error } = await this.sb.from('match_evidence')
       .insert(images.map(img => ({ match_id: matchId, image: img, uploaded_by: this.me })));
     if(error) throw new Error(this._err(error));
+  },
+
+  /* — دردشة المباراة — */
+  async messages(matchId){
+    const { data, error } = await this.sb.from('match_messages')
+      .select('*').eq('match_id', matchId).order('created_at');
+    if(error) return [];
+    return data || [];
+  },
+  async sendMessage(matchId, body){
+    const { error } = await this.sb.from('match_messages')
+      .insert({ match_id: matchId, player_id: this.me, body: body.trim() });
+    if(error){
+      if(String(error.message).includes('row-level security'))
+        throw new Error('الدردشة مغلقة الآن');
+      throw new Error(this._err(error));
+    }
+  },
+  _chatChan: null,
+  watchChat(matchId, cb){
+    this.unwatchChat();
+    if(!matchId || !this.session) return;
+    this._chatChan = this.sb.channel('chat_' + matchId)
+      .on('postgres_changes',
+          { event:'INSERT', schema:'public', table:'match_messages',
+            filter:'match_id=eq.'+matchId }, cb)
+      .subscribe();
+  },
+  unwatchChat(){
+    if(this._chatChan){ this.sb.removeChannel(this._chatChan); this._chatChan = null; }
   },
 
   /* — سجل التدقيق — */
@@ -1343,6 +1406,14 @@ const UI = {
       ${m.result_type==='walkover' ? `<div class="tag" style="margin-top:8px">فوز بالانسحاب</div>` : ''}
     </div>`;
 
+    /* الدردشة — لطرفَي المباراة والمشرف فقط */
+    if((isMine || adm) && Store.session && m.status !== 'cancelled'){
+      h += `<div class="sec"><h2>الدردشة</h2><div class="rule"></div></div>${this.chatBox(m, isMine)}`;
+      this._chatFor = this.chatState(m).open ? m.id : null;
+    } else {
+      this._chatFor = null;
+    }
+
     /* حضور اللاعبين */
     if(['scheduled','live'].includes(m.status)){
       h += `<div class="sec"><h2>حضور اللاعبين</h2><div class="rule"></div></div>
@@ -1493,6 +1564,81 @@ const UI = {
   },
 
   _evd: [],
+  /* ── دردشة المباراة ── */
+  chatState(m){
+    if(m.status === 'cancelled') return { open:false, why:'ملغاة' };
+    if(['live','pending_confirmation','disputed'].includes(m.status)) return { open:true };
+    if(m.status === 'completed'){
+      const end = m.confirmed_at ? new Date(m.confirmed_at).getTime() + 7200000 : 0;
+      return Date.now() < end
+        ? { open:true, closing:U.mins(end - Date.now()) }
+        : { open:false, why:'انتهت' };
+    }
+    const opensAt = U.matchMoment(m).getTime() - 1800000;
+    const left = U.mins(opensAt - Date.now());
+    return left <= 0 ? { open:true } : { open:false, why:'قبل', left };
+  },
+
+  chatBox(m, canWrite){
+    const st = this.chatState(m);
+    let body;
+    if(st.open && !canWrite){
+      body = `<div class="chat-log" id="chatlog"><div class="chat-shut">جارٍ التحميل…</div></div>
+        <div class="chat-shut" style="border-top:1px solid var(--line);padding:11px">
+          تطّلع كمشرف — لا يمكنك الكتابة في دردشة لست طرفاً فيها</div>`;
+    } else if(st.open){
+      body = `<div class="chat-log" id="chatlog"><div class="chat-shut">جارٍ التحميل…</div></div>
+        <div class="chat-bar">
+          <input id="chatin" placeholder="اكتب رسالة…" maxlength="500"
+            onkeydown="if(event.key==='Enter')UI.sendChat('${m.id}')">
+          <button class="chat-send" onclick="UI.sendChat('${m.id}')">↑</button>
+        </div>`;
+    } else if(st.why === 'قبل'){
+      body = `<div class="chat-shut"><b>تُفتح قبل المباراة بنصف ساعة</b>
+        بعد ${U.humanWait(st.left)} من الآن</div>`;
+    } else if(st.why === 'انتهت'){
+      body = `<div class="chat-shut"><b>أُغلقت الدردشة</b>
+        تُمسح الرسائل بعد ساعتين من اعتماد النتيجة</div>`;
+    } else {
+      body = `<div class="chat-shut"><b>الدردشة مغلقة</b>${U.esc(st.why)}</div>`;
+    }
+    return `<div class="chat">
+      <div class="chat-head">
+        <b>دردشة المباراة</b>
+        ${st.open ? `<span class="tag win"><i class="dot"></i>مفتوحة</span>` : ''}
+        ${st.closing ? `<span class="tag">تُغلق بعد ${U.humanWait(st.closing)}</span>` : ''}
+      </div>${body}</div>
+      <div class="tiny dim center" style="margin-top:7px">
+        خاصة بطرفَي المباراة والمشرف · تُمسح تلقائياً بعد انتهائها</div>`;
+  },
+
+  async loadChat(matchId, PM){
+    const box = document.getElementById('chatlog');
+    if(!box) return;
+    const msgs = await Store.messages(matchId);
+    box.innerHTML = msgs.length ? msgs.map(x=>{
+      const mine = x.player_id === Store.me;
+      return `<div class="msg ${mine?'mine':''}">
+        ${mine ? '' : `<div class="who">${U.esc(PM[x.player_id]?.name || '—')}</div>`}
+        ${U.esc(x.body)}
+        <time>${U.fmtStamp(x.created_at).split('· ')[1] || ''}</time>
+      </div>`;
+    }).join('') : `<div class="chat-shut">لا رسائل بعد. ابدأ أنت.</div>`;
+    box.scrollTop = box.scrollHeight;
+  },
+
+  async sendChat(matchId){
+    const el = document.getElementById('chatin');
+    const v = (el.value || '').trim();
+    if(!v) return;
+    el.value = '';
+    try{
+      await Store.sendMessage(matchId, v);
+      const PM = await this.playersMap();
+      await this.loadChat(matchId, PM);
+    }catch(e){ el.value = v; this.toast(e.message,'err'); }
+  },
+
   evidenceHtml(){
     if(!this._evd.length) return '';
     return `<div class="evd">${this._evd.map((e,i)=>
@@ -2114,6 +2260,15 @@ const UI = {
     view.innerHTML = html + this.foot();
     await this.chrome();
     window.scrollTo({top:0});
+
+    // الدردشة: تحميل الرسائل والاشتراك في التحديث اللحظي
+    if(Store.configured) Store.unwatchChat();
+    if(this._chatFor){
+      const cid = this._chatFor;
+      const PM = await this.playersMap();
+      await this.loadChat(cid, PM);
+      Store.watchChat(cid, () => this.loadChat(cid, PM));
+    }
   }
 };
 
